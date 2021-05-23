@@ -2,11 +2,15 @@
 using System.Collections.Generic;
 using System.Linq;
 using System.Text;
+using websocket_server;
 
 namespace SimpleDiscordApi
 {
-    public class DiscordRestApi
+    public static class DiscordRestApi
     {
-        
+        public static void ChannelCreateMessage(int channelId, string message)
+        {
+
+        }
     }
 }

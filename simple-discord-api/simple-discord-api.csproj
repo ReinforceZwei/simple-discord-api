@@ -6,7 +6,7 @@
     <Platform Condition=" '$(Platform)' == '' ">AnyCPU</Platform>
     <ProjectGuid>{95EC6F96-B454-4283-87F8-640F61A2855F}</ProjectGuid>
     <OutputType>Library</OutputType>
-    <RootNamespace>simple_discord_api</RootNamespace>
+    <RootNamespace>SimpleDiscordApi</RootNamespace>
     <AssemblyName>simple-discord-api</AssemblyName>
     <TargetFrameworkVersion>v4.0</TargetFrameworkVersion>
     <FileAlignment>512</FileAlignment>
@@ -44,8 +44,15 @@
     <Reference Include="System.Xml" />
   </ItemGroup>
   <ItemGroup>
+    <Compile Include="DiscordGatewayApi.cs" />
     <Compile Include="DiscordRestApi.cs" />
     <Compile Include="Properties\AssemblyInfo.cs" />
+  </ItemGroup>
+  <ItemGroup>
+    <ProjectReference Include="..\..\websocket-server\websocket-server\websocket-server.csproj">
+      <Project>{b1135640-211d-49c7-97db-6d948b84ad2b}</Project>
+      <Name>websocket-server</Name>
+    </ProjectReference>
   </ItemGroup>
   <Import Project="$(MSBuildToolsPath)\Microsoft.CSharp.targets" />
 </Project>
