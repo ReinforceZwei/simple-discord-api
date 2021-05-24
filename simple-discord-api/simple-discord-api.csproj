@@ -46,6 +46,7 @@
   <ItemGroup>
     <Compile Include="DiscordGatewayApi.cs" />
     <Compile Include="DiscordRestApi.cs" />
+    <Compile Include="GatewayOpcode.cs" />
     <Compile Include="Properties\AssemblyInfo.cs" />
   </ItemGroup>
   <ItemGroup>
