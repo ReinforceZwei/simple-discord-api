@@ -47,7 +47,9 @@
     <Compile Include="DiscordGatewayApi.cs" />
     <Compile Include="DiscordRestApi.cs" />
     <Compile Include="GatewayOpcode.cs" />
+    <Compile Include="Message.cs" />
     <Compile Include="Properties\AssemblyInfo.cs" />
+    <Compile Include="User.cs" />
   </ItemGroup>
   <ItemGroup>
     <ProjectReference Include="..\..\websocket-server\websocket-server\websocket-server.csproj">

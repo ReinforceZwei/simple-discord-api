@@ -5,7 +5,7 @@ using System.Text;
 
 namespace SimpleDiscordApi
 {
-    enum GatewayOpcode
+    internal enum GatewayOpcode
     {
         Dispatch = 0,
         Heartbeat = 1,

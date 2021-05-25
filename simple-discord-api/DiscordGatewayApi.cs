@@ -11,11 +11,16 @@ namespace SimpleDiscordApi
     public class DiscordGatewayApi
     {
         private readonly string GatewayUrl = "wss://gateway.discord.gg/?v=9&encoding=json";
-        private readonly string LibraryName = "CustomImplementation";
-        private readonly string Token;
+        internal readonly string LibraryName = "CustomImplementation";
+        internal readonly string Token;
+
+        private string sessionId;
 
         private WebsocketConnection connection;
         private int lastSeq = -1;
+        private bool lastHeartBeatAck = true;
+
+        private Thread HeartbeatThread;
 
         public DiscordGatewayApi(string token) 
         {
@@ -27,114 +32,220 @@ namespace SimpleDiscordApi
             connection = new WebsocketConnection(new Uri(GatewayUrl));
             connection.Connect();
             connection.Handshake();
-            var hello = connection.ReadNextFrame(); // TODO: Handle heartbeat
+            connection.DisconnectEvent += _OnWsDisconnect;
+
+            var hello = connection.ReadNextFrame();
             var json = Json.ParseJson(hello.DataAsString);
             int heartbeatInterval = int.Parse(json.Properties["d"].Properties["heartbeat_interval"].StringValue);
-            new Thread(new ThreadStart(() =>
+            HeartbeatThread = new Thread(new ThreadStart(() =>
             {
                 var rng = new Random();
                 Thread.Sleep((int)Math.Floor(rng.NextDouble() * heartbeatInterval));
                 while (true)
                 {
+                    if (connection.State != State.Open)
+                    {
+                        Console.WriteLine("WS state not open, heartbeat thread abort");
+                        HeartbeatThread.Abort();
+                        break;
+                    }
+                    if (!lastHeartBeatAck)
+                    {
+                        Reconnect();
+                        break;
+                    }
                     string seq = lastSeq == -1 ? "null" : lastSeq.ToString();
                     Console.WriteLine("<<<<<< Heartbeat SEQ: " + seq);
                     connection.Send("{\"op\":1,\"d\":" + seq + "}");
+                    lastHeartBeatAck = false;
                     Thread.Sleep(heartbeatInterval);
                 }
-            })).Start();
+            }));
+            HeartbeatThread.Start();
         }
 
-        public void Identify()
+        public bool Identify()
         {
-            Dictionary<string, object> req = new Dictionary<string, object>()
+            var data = new Dictionary<string, object>()
             {
-                { "op", (int)GatewayOpcode.Identify },
-                { 
-                    "d", new Dictionary<string, object>()
+                { "token", Token },
+                { "intents", (1 << 9) | (1 << 12) }, // Guild Message and Direct Message
+                {
+                    "properties", new Dictionary<string, object>()
                     {
-                        { "token", Token },
-                        { "intents", (1 << 9) | (1 << 12) }, // Guild Message and Direct Message
-                        {
-                            "properties", new Dictionary<string, object>()
-                            {
-                                { "$os", "linux" },
-                                { "$browser", LibraryName },
-                                { "$device", LibraryName }
-                            }
-                        }
-                    } 
+                        { "$os", "linux" },
+                        { "$browser", LibraryName },
+                        { "$device", LibraryName }
+                    }
                 }
             };
-            string json = JsonMaker.ToJson(req);
+
+            string json = GetPayloadString(GatewayOpcode.Identify, data);
             connection.Send(json);
             var resp = connection.ReadNextFrame();
-            var j = Json.ParseJson(resp.DataAsString);
-            Console.WriteLine(">>>>>>");
-            Console.WriteLine(resp.DataAsString);
-            //try
-            //{
-            // TODO: Error handling (e.g. Invalid token)
-            // TODO: Save session ID somewhere
-            string sessionId = j.Properties["d"].Properties["session_id"].StringValue; 
-            Ready?.Invoke(this, new ReadyEventArgs(sessionId));
-            //}
-            //catch { }
-            connection.Message += _OnWsMessage;
-            connection.StartReceiveAsync();
-            UpdatePresence();
+            if (resp.Opcode == Opcode.Text)
+            {
+                var j = Json.ParseJson(resp.DataAsString);
+                Console.WriteLine(">>>>>>");
+                Console.WriteLine(resp.DataAsString);
+                // TODO: Save session ID somewhere
+                sessionId = j.Properties["d"].Properties["session_id"].StringValue;
+
+                Ready?.Invoke(this, new ReadyEventArgs(sessionId));
+                connection.Message += _OnWsMessage;
+                connection.StartReceiveAsync();
+                UpdatePresence();
+                return true;
+            }
+            else if (resp.Opcode == Opcode.ClosedConnection)
+            {
+                int code = resp.CloseStatusCode ?? -1;
+                Console.WriteLine("Identity failed with code " + code);
+                connection.Close();
+                return false;
+            }
+            else
+            {
+                // WS opcode other than text and close
+                connection.Close();
+                return false;
+            }
         }
 
         public void UpdatePresence(string status = "online")
         {
-            Dictionary<string, object> req = new Dictionary<string, object>()
+            var data = new Dictionary<string, object>()
             {
-                { "op", (int)GatewayOpcode.PresenceUpdate },
-                {
-                    "d", new Dictionary<string, object>()
-                    {
-                        { "since", null },
-                        { "activities", new List<object>() }, 
-                        { "status", status },
-                        { "afk", false }
-                    }
-                }
+                { "since", null },
+                { "activities", new List<object>() },
+                { "status", status },
+                { "afk", false }
             };
-            string json = JsonMaker.ToJson(req);
+            string json = GetPayloadString(GatewayOpcode.PresenceUpdate, data);
+            //Console.WriteLine("<<<<<< Update presence");
+            //Console.WriteLine(json);
             connection.Send(json);
+        }
+
+        public void Resume()
+        {
+            // Assume connected to gateway, but not yet start receive
+            if (!string.IsNullOrEmpty(sessionId))
+            {
+                var data = new Dictionary<string, object>()
+                {
+                    { "token", Token },
+                    { "session_id", sessionId },
+                    { "seq", lastSeq }
+                };
+                string json = GetPayloadString(GatewayOpcode.Resume, data);
+                connection.Send(json);
+                var nextResp = connection.ReadNextFrame();
+                var j = Json.ParseJson(nextResp.DataAsString);
+                if (j.Properties["op"].StringValue == ((int)GatewayOpcode.InvalidSession).ToString())
+                {
+                    Thread.Sleep(2500);
+                    Identify();
+                }
+                else
+                {
+                    _OnWsMessage(this, new TextMessageEventArgs() { Client = connection, Message = nextResp.DataAsString });
+                    connection.StartReceiveAsync();
+                }
+            }
+            else
+            {
+                Identify();
+            }
+        }
+
+        public void Reconnect()
+        {
+            // reconnect to gateway
+            connection.Close();
+            connection = null;
+
+            // Reset variables
+            try
+            {
+                HeartbeatThread.Abort();
+                HeartbeatThread = null;
+            }
+            catch { }
+            lastHeartBeatAck = true;
+            Connect();
+            Resume();
         }
 
         private void _OnWsMessage(object s, TextMessageEventArgs e)
         {
-            Console.WriteLine(">>>>>> WS Message");
-            Console.WriteLine(e.Message);
+            //Console.WriteLine(">>>>>> WS Message");
+            //Console.WriteLine(e.Message);
             var json = Json.ParseJson(e.Message);
-            if (json.Properties["op"].StringValue == ((int)GatewayOpcode.Dispatch).ToString()) // Dispatch event
+            GatewayOpcode opcode = (GatewayOpcode)int.Parse(json.Properties["op"].StringValue);
+
+            switch (opcode)
             {
-                lastSeq = int.Parse(json.Properties["s"].StringValue);
-                string eventName = json.Properties["t"].StringValue;
-                if (eventName == "MESSAGE_CREATE")
-                {
-                    Console.WriteLine(">>> Incomming Message");
-                    var msgObj = json.Properties["d"];
-                    string channelId = msgObj.Properties["channel_id"].StringValue;
-                    string content = msgObj.Properties["content"].StringValue;
-                    string sender = msgObj.Properties["author"].Properties["username"].StringValue;
-                    string senderId = msgObj.Properties["author"].Properties["id"].StringValue;
-                    string senderTag = msgObj.Properties["author"].Properties["discriminator"].StringValue;
-                    var eventArgs = new MessageCreateEventArgs(channelId, content, sender, senderId, senderTag);
-                    MessageCreate?.Invoke(this, eventArgs);
-                    Console.WriteLine($"Channel ID: {channelId}\nContent: {content}\nAuthor: {sender}");
-                }
+                case GatewayOpcode.Dispatch:
+                    {
+                        lastSeq = int.Parse(json.Properties["s"].StringValue);
+                        string eventName = json.Properties["t"].StringValue;
+                        if (eventName == "MESSAGE_CREATE")
+                        {
+                            var msgObj = json.Properties["d"];
+                            Message message = Message.ParseMessage(this, msgObj);
+                            var eventArgs = new MessageCreateEventArgs(message);
+                            MessageCreate?.Invoke(this, eventArgs);
+                            //Console.WriteLine(">>> Incomming Message");
+                            //Console.WriteLine($"Channel ID: {message.ChannelId}\nContent: {message.Content}\nAuthor: {message.Author.Username}");
+                        }
+                        break;
+                    }
+                case GatewayOpcode.HeartbeatACK:
+                    {
+                        lastHeartBeatAck = true;
+                        break;
+                    }
+                case GatewayOpcode.Reconnect:
+                    {
+                        // Should be a rare event
+                        Reconnect();
+                        break;
+                    }
             }
         }
 
         private void _OnWsDisconnect(object s, DisconnectEventArgs e)
         {
+            // Disconnected after few momment after reconnect
             Console.WriteLine("Disconnected with Gateway");
+            GatewayDisconnect?.Invoke(this, new GatewatDisconnectEventArgs());
         }
 
+        private static string GetPayloadString(GatewayOpcode opcode, object data)
+        {
+            var payload = new Dictionary<string, object>()
+            {
+                { "op", (int)opcode },
+                { "d", data }
+            };
+            return JsonMaker.ToJson(payload);
+        }
+
+        /// <summary>
+        /// Emitted when the gateway is ready to send and receive event
+        /// </summary>
         public event EventHandler<ReadyEventArgs> Ready;
+
+        /// <summary>
+        /// Emitted when a new message was created
+        /// </summary>
         public event EventHandler<MessageCreateEventArgs> MessageCreate;
+
+        /// <summary>
+        /// Emitted when disconnected with gateway. You do not need to reconnect yourself as it is handled automatically
+        /// </summary>
+        public event EventHandler<GatewatDisconnectEventArgs> GatewayDisconnect;
     }
 
     public class ReadyEventArgs : EventArgs
@@ -148,19 +259,13 @@ namespace SimpleDiscordApi
 
     public class MessageCreateEventArgs : EventArgs
     {
-        public readonly string ChannelId;
-        public readonly string Content;
-        public readonly string Author;
-        public readonly string AuthorId;
-        public readonly string AuthorTag;
+        public Message Message;
         public MessageCreateEventArgs() { }
-        public MessageCreateEventArgs(string channelId, string content, string author, string authorId, string authorTag)
+        public MessageCreateEventArgs(Message message)
         {
-            ChannelId = channelId;
-            Content = content;
-            Author = author;
-            AuthorId = authorId;
-            AuthorTag = authorTag;
+            Message = message;
         }
     }
+
+    public class GatewatDisconnectEventArgs : EventArgs { }
 }
