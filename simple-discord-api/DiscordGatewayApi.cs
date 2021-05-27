@@ -14,13 +14,15 @@ namespace SimpleDiscordApi
         internal readonly string LibraryName = "CustomImplementation";
         internal readonly string Token;
 
-        private string sessionId;
+        public string sessionId;
 
         private WebsocketConnection connection;
         private int lastSeq = -1;
         private bool lastHeartBeatAck = true;
 
         private Thread HeartbeatThread;
+
+        private static bool debug = true;
 
         public DiscordGatewayApi(string token) 
         {
@@ -37,31 +39,7 @@ namespace SimpleDiscordApi
             var hello = connection.ReadNextFrame();
             var json = Json.ParseJson(hello.DataAsString);
             int heartbeatInterval = int.Parse(json.Properties["d"].Properties["heartbeat_interval"].StringValue);
-            HeartbeatThread = new Thread(new ThreadStart(() =>
-            {
-                var rng = new Random();
-                Thread.Sleep((int)Math.Floor(rng.NextDouble() * heartbeatInterval));
-                while (true)
-                {
-                    if (connection.State != State.Open)
-                    {
-                        Console.WriteLine("WS state not open, heartbeat thread abort");
-                        HeartbeatThread.Abort();
-                        break;
-                    }
-                    if (!lastHeartBeatAck)
-                    {
-                        Reconnect();
-                        break;
-                    }
-                    string seq = lastSeq == -1 ? "null" : lastSeq.ToString();
-                    Console.WriteLine("<<<<<< Heartbeat SEQ: " + seq);
-                    connection.Send("{\"op\":1,\"d\":" + seq + "}");
-                    lastHeartBeatAck = false;
-                    Thread.Sleep(heartbeatInterval);
-                }
-            }));
-            HeartbeatThread.Start();
+            StartHeartbeat(heartbeatInterval);
         }
 
         public bool Identify()
@@ -86,13 +64,14 @@ namespace SimpleDiscordApi
             if (resp.Opcode == Opcode.Text)
             {
                 var j = Json.ParseJson(resp.DataAsString);
-                Console.WriteLine(">>>>>>");
-                Console.WriteLine(resp.DataAsString);
+                DebugLog(">>>>>> READY");
+                DebugLog(resp.DataAsString);
                 // TODO: Save session ID somewhere
                 sessionId = j.Properties["d"].Properties["session_id"].StringValue;
+                lastSeq = -1;
 
                 Ready?.Invoke(this, new ReadyEventArgs(sessionId));
-                connection.Message += _OnWsMessage;
+                connection.TextMessage += _OnWsMessage;
                 connection.StartReceiveAsync();
                 UpdatePresence();
                 return true;
@@ -100,14 +79,16 @@ namespace SimpleDiscordApi
             else if (resp.Opcode == Opcode.ClosedConnection)
             {
                 int code = resp.CloseStatusCode ?? -1;
-                Console.WriteLine("Identity failed with code " + code);
+                DebugLog("Identity failed with code " + code);
+                // Still in custom message handling
+                connection.Send(Opcode.ClosedConnection);
                 connection.Close();
                 return false;
             }
             else
             {
                 // WS opcode other than text and close
-                connection.Close();
+                connection.Disconnect();
                 return false;
             }
         }
@@ -141,16 +122,22 @@ namespace SimpleDiscordApi
                 string json = GetPayloadString(GatewayOpcode.Resume, data);
                 connection.Send(json);
                 var nextResp = connection.ReadNextFrame();
+                DebugLog(">>>>>> RESUME RESULT");
+                DebugLog(nextResp.DataAsString);
                 var j = Json.ParseJson(nextResp.DataAsString);
                 if (j.Properties["op"].StringValue == ((int)GatewayOpcode.InvalidSession).ToString())
                 {
+                    DebugLog("Resume result: Invalid session");
                     Thread.Sleep(2500);
                     Identify();
                 }
                 else
                 {
+                    DebugLog("Gateway Resumed");
                     _OnWsMessage(this, new TextMessageEventArgs() { Client = connection, Message = nextResp.DataAsString });
+                    connection.TextMessage += _OnWsMessage;
                     connection.StartReceiveAsync();
+                    UpdatePresence();
                 }
             }
             else
@@ -162,25 +149,64 @@ namespace SimpleDiscordApi
         public void Reconnect()
         {
             // reconnect to gateway
-            connection.Close();
+            connection.Disconnect(1000);
             connection = null;
 
-            // Reset variables
             try
             {
                 HeartbeatThread.Abort();
-                HeartbeatThread = null;
             }
             catch { }
+            HeartbeatThread = null;
             lastHeartBeatAck = true;
             Connect();
             Resume();
+        }
+
+        public void Disconnect()
+        {
+            connection.Disconnect(1000);
+        }
+
+        private void StartHeartbeat(int interval)
+        {
+            HeartbeatThread = new Thread(new ThreadStart(() =>
+            {
+                var rng = new Random();
+                Thread.Sleep((int)Math.Floor(rng.NextDouble() * interval));
+                while (true)
+                {
+                    if (connection.State != State.Open)
+                    {
+                        DebugLog("WS state not open, heartbeat thread abort");
+                        HeartbeatThread.Abort();
+                        break;
+                    }
+                    if (!lastHeartBeatAck)
+                    {
+                        DebugLog("Last heartbeat ACK not received, reconnect");
+                        Reconnect();
+                        break;
+                    }
+                    string seq = lastSeq == -1 ? "null" : lastSeq.ToString();
+                    DebugLog("<<<<<< Heartbeat SEQ: " + seq);
+                    connection.Send("{\"op\":1,\"d\":" + seq + "}");
+                    lastHeartBeatAck = false;
+                    Thread.Sleep(interval);
+                }
+            }));
+            HeartbeatThread.Start();
         }
 
         private void _OnWsMessage(object s, TextMessageEventArgs e)
         {
             //Console.WriteLine(">>>>>> WS Message");
             //Console.WriteLine(e.Message);
+            if (string.IsNullOrEmpty(e.Message))
+            {
+                DebugLog("Empty message in WsMessage!");
+                return;
+            }
             var json = Json.ParseJson(e.Message);
             GatewayOpcode opcode = (GatewayOpcode)int.Parse(json.Properties["op"].StringValue);
 
@@ -209,6 +235,7 @@ namespace SimpleDiscordApi
                 case GatewayOpcode.Reconnect:
                     {
                         // Should be a rare event
+                        DebugLog("Gateway asked for reconnect");
                         Reconnect();
                         break;
                     }
@@ -218,8 +245,8 @@ namespace SimpleDiscordApi
         private void _OnWsDisconnect(object s, DisconnectEventArgs e)
         {
             // Disconnected after few momment after reconnect
-            Console.WriteLine("Disconnected with Gateway");
-            GatewayDisconnect?.Invoke(this, new GatewatDisconnectEventArgs());
+            DebugLog("Disconnected with Gateway: " + e.Code);
+            GatewayDisconnect?.Invoke(this, new GatewatDisconnectEventArgs(e.Code));
         }
 
         private static string GetPayloadString(GatewayOpcode opcode, object data)
@@ -230,6 +257,17 @@ namespace SimpleDiscordApi
                 { "d", data }
             };
             return JsonMaker.ToJson(payload);
+        }
+
+        private static void DebugLog<T>(T text)
+        {
+            if (debug)
+                Console.WriteLine(text);
+        }
+
+        public static void SetDebugMode(bool enable)
+        {
+            debug = enable;
         }
 
         /// <summary>
@@ -267,5 +305,12 @@ namespace SimpleDiscordApi
         }
     }
 
-    public class GatewatDisconnectEventArgs : EventArgs { }
+    public class GatewatDisconnectEventArgs : EventArgs 
+    {
+        public int Code;
+        public GatewatDisconnectEventArgs(int code)
+        {
+            Code = code;
+        }
+    }
 }
